@@ -82,32 +82,18 @@ function dbgsysdump {
     local output_tgz=
     local dump_dir=
     local dyld_sys_caches=
+    local dyld_sys_archs=
     local dyld_sys_tmp=
     local lib=
     local lib_found=
     local libs_lv=
+    local libs_found=
     local libs_nf=
     local res=
+    local cp_v=
+    local cp_res=
 
     level=0
-
-    dyld_sys_caches=()
-
-    case "$(uname -m)" in
-        x86_64)
-            dyld_sys_caches+=(
-                "/System/Library/dyld/dyld_shared_cache_x86_64"
-                "/System/Library/dyld/dyld_shared_cache_x86_64h"
-                "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h")
-        ;;
-        arm64)
-            dyld_sys_caches+=(
-                "/System/Library/dyld/dyld_shared_cache_x86_64"
-                "/System/Library/dyld/dyld_shared_cache_arm64e"
-                "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64"
-                "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e")
-        ;;
-    esac
 
     while (( "$#" )); do
         case "$1" in
@@ -179,28 +165,7 @@ function dbgsysdump {
     fi
 
     # Find libraries on the filesystem first, this has priority over cache
-    libs_nf=()
-
-    # Starting from macOS 11 (BigSur) libraries are managed by cache and no longer present on the filesystem
-    dyld_sys_tmp=
-
-    for dyld_sys_cache in "${dyld_sys_caches[@]}"; do
-        if [[ -f "/usr/lib/dsc_extractor.bundle" ]] &&
-            [[ -f "$dyld_sys_cache" ]]; then
-
-            [[ $dyld_sys_tmp ]] || dyld_sys_tmp="$(mktemp -d)"
-
-            echo "Extracting cached libraries from \"$dyld_sys_cache\"..."
-
-            if dyld_shared_cache_util "$dyld_sys_cache" "$dyld_sys_tmp" > /dev/null 2>&1; then
-                echo "  Done"
-            else
-                echo "  Warning: failed to extract cached libraries error=$?"
-            fi
-
-            echo ""
-        fi
-    done
+    libs_found=()
 
     echo "Inspecting ${#libs_lv[@]} entries..."
 
@@ -209,22 +174,63 @@ function dbgsysdump {
 
         if [[ -e "$lib" ]]; then
             lib_found=1
-            mkdir -p "$dump_dir$(dirname $lib)" &&
-                cp -RHf "$lib" "$dump_dir$(dirname $lib)" || echo "  Warning: cp1=$? \"$lib\""
+            mkdir -p "$dump_dir$(dirname $lib)"
+            cp_v=$(cp -RHf "$lib" "$dump_dir$(dirname $lib)")
+            cp_res=$?
+            [[ $cp_res -eq 0 ]] || echo "  Warning: \"$lib\", cp=$cp_res ($cp_v)"
         fi
 
-        if [[ "$dyld_sys_tmp" ]] && [[ -e "$dyld_sys_tmp$lib" ]]; then
-            lib_found=1
-            mkdir -p "$dump_dir$(dirname $lib)" || echo "  Warning: mkdir=$? \"$lib\""
-                cp -Rn "$dyld_sys_tmp$lib" "$dump_dir$(dirname $lib)" || echo "  Warning: cp2=$? \"$lib\""
+        if [[ $lib_found ]]; then
+            libs_found+=("$lib")
         fi
+    done
 
-        if [[ ! $lib_found ]]; then
-            libs_nf+=("$lib")
+    # Starting from macOS 11 (BigSur) libraries are managed by cache and no longer present on the filesystem
+    dyld_sys_caches=("/System/Library/dyld" "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld")
+    dyld_sys_archs=("x86_64" "x86_64h" "arm64" "arm64e")
+
+    for dyld_sys_cache in "${dyld_sys_caches[@]}"; do
+        for dyld_sys_arch in "${dyld_sys_archs[@]}"; do
+            if [[ -f "$dyld_sys_cache/dyld_shared_cache_$dyld_sys_arch" ]]; then
+
+                [[ $dyld_sys_tmp ]] || dyld_sys_tmp="$(mktemp -d)"
+
+                mkdir -p "$dyld_sys_tmp/$dyld_sys_arch"
+
+                echo "  Extracting cached libraries from \"$dyld_sys_cache\" ($dyld_sys_arch)..."
+
+                if dyld_shared_cache_util "$dyld_sys_cache/dyld_shared_cache_$dyld_sys_arch" "$dyld_sys_tmp/$dyld_sys_arch" > /dev/null 2>&1; then
+                    echo "    Done"
+                else
+                    echo "    Warning: failed to extract cached libraries error=$?"
+                fi
+            fi
+        done
+    done
+
+    for lib in "${libs_lv[@]}"; do
+        lib_found=
+
+        for dyld_sys_arch in "${dyld_sys_archs[@]}"; do
+            if [[ -e "$dyld_sys_tmp/$dyld_sys_arch$lib" ]]; then
+                lib_found=1
+                mkdir -p "$dump_dir/$dyld_sys_arch$(dirname $lib)"
+                cp_v=$(cp -Rn "$dyld_sys_tmp/$dyld_sys_arch$lib" "$dump_dir/$dyld_sys_arch$(dirname $lib)")
+                cp_res=$?
+                [[ $cp_res -eq 0 ]] || echo "  Warning: \"$lib\", cp=$cp_res ($cp_v)"
+            fi
+        done
+
+        if [[ $lib_found ]]; then
+            libs_found+=("$lib")
         fi
     done
 
     echo ""
+
+    IFS=$'\n'
+    libs_nf=($(comm -13 <(printf '%s\n' "${libs_found[@]}" | sort) <(printf '%s\n' "${libs_lv[@]}" | sort)))
+    unset IFS
 
     # List not found libs
     if [[ $res -eq 0 ]] && [[ "${#libs_nf[@]}" -gt 0 ]]; then
