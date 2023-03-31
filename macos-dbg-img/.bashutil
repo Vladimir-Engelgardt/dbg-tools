@@ -1,0 +1,27 @@
+function __dbg_ps_pwd {
+    local pwd
+    local home
+    local sects
+
+    pwd="$PWD"
+    home=$(bash -c "cd ~$(printf %q $(whoami)) && pwd")
+
+    if [[ $pwd == $home* ]]; then
+        pwd="${pwd:${#home}}"
+        sects="${pwd//[^\/]}"
+
+        [[ ${#sects} -gt 3 ]] &&
+            echo "~$(echo "$pwd" | awk -F "/" '{print "/"$2}')/../${pwd#${pwd%/*/*}/}" ||
+                echo "~$pwd"
+    else
+        sects="${pwd//[^\/]}"
+
+        [[ ${#sects} -gt 4 ]] &&
+            echo "$(echo "$pwd" | awk -F "/" '{print "/"$2"/"$3}')/../${pwd#${pwd%/*/*}/}" ||
+                echo "$pwd"
+    fi
+}
+
+function __dbg_ps1 {
+    PS1="\e[0;33m\u\e[m\e[0;90m@\e[m\e[0;32m$(__dbg_ps_pwd)\e[m\e[0;90m$\e[m "
+}

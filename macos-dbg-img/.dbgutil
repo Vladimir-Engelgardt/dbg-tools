@@ -1,0 +1,254 @@
+__is_uint() { case $1 in '' | *[!0-9]*) return 1;; esac ;}
+
+function dbgsshr {
+    if [[ $# -lt 1 ]] ; then
+        echo "Remote SSH port forwarding 5777:5777"
+        echo ""
+        echo "Usage: dbgsshr [user@]host[:port]"
+        echo ""
+        return 1
+    fi
+
+    local dest
+
+    dest=(${1//:/ })
+
+    if [[ ${#dest[@]} -gt 1 ]]; then
+        ssh -N -R 5777:localhost:5777 -p "${dest[1]}" "${dest[0]}"
+    else
+        ssh -N -R 5777:localhost:5777 "${dest[0]}"
+    fi
+
+    return $?
+}
+
+function dbgsrvatt {
+    if [[ $# -lt 1 ]] ; then
+        echo "Attach debugserver to process by pid"
+        echo ""
+        echo "Usage: dbgsrvatt pid"
+        echo ""
+        return 1
+    fi
+
+    debugserver localhost:5777 --attach=$1
+
+    return $?
+}
+
+function dbgsrvattlss {
+    local lss=
+
+    lss="LSStudio"
+
+    IFS=$'\n' read -d '' -r -a pids <<EOF
+$(pgrep -x "$lss")
+EOF
+
+    while [[ ${#pids[@]} -gt 1 ]]; do
+        echo "There are multiple instances running"
+        echo ""
+
+        for ((i=0; i<${#pids[@]}; ++i)); do
+            printf "%+5s %s\n" "[$(($i + 1))]" "$(ps -p ${pids[i]} -o 'pid,command' | tail -n +2)"
+
+        done
+
+        echo ""
+
+        choice=
+        while ! __is_uint "$choice" ||
+            [[ "$choice" -lt 1 ]] ||
+            [[ "$choice" -gt ${#pids[@]} ]]; do
+            read -p "Select pid #: " -a choice
+        done
+
+        echo ""
+
+        pids=(${pids[$(($choice - 1))]})
+    done
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        echo "\"$lss\" is not running"
+        return 0
+    fi
+
+    dbgsrvatt ${pids[0]} || return $?
+}
+
+function dbgsysdump {
+    local i
+    local level=
+    local output_tgz=
+    local dump_dir=
+    local dyld_sys_caches=
+    local dyld_sys_tmp=
+    local lib=
+    local lib_found=
+    local libs_lv=
+    local libs_nf=
+    local res=
+
+    level=0
+
+    dyld_sys_caches=()
+
+    case "$(uname -m)" in
+        x86_64)
+            dyld_sys_caches+=(
+                "/System/Library/dyld/dyld_shared_cache_x86_64"
+                "/System/Library/dyld/dyld_shared_cache_x86_64h"
+                "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h")
+        ;;
+        arm64)
+            dyld_sys_caches+=(
+                "/System/Library/dyld/dyld_shared_cache_x86_64"
+                "/System/Library/dyld/dyld_shared_cache_arm64e"
+                "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64"
+                "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e")
+        ;;
+    esac
+
+    while (( "$#" )); do
+        case "$1" in
+            -l|--level)
+                if ! __is_uint "$2"; then
+                    echo "Invalid level value \"$2\""
+                    return 1
+                fi
+                level="$2"
+                shift
+            ;;
+            -h|--help)
+                echo "Make system dump for debug interop"
+                echo ""
+                echo "Usage: dbgsysdump [output.tgz] [-l level]"
+                echo ""
+                return 1
+            ;;
+            *)
+                if [[ $output_tgz ]]; then
+                    echo "Unknown option \"$1\""
+                    return 1
+                fi
+
+                output_tgz=$1
+            ;;
+        esac
+
+        shift
+    done
+
+    if [[ -z "$output_tgz" ]]; then
+        output_tgz="$PWD/$(sw_vers -buildVersion).tgz"
+    fi
+
+    dump_dir="$(dirname "${output_tgz}")/$(sw_vers -buildVersion)"
+
+    mkdir -p "$dump_dir" || return $?
+
+    # Build libs list for current level
+    libs_lv=()
+
+    echo "Reading entries for level=$level..."
+
+    for dumpsys in "$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"/.dumpsys*; do
+        [[ -f "$dumpsys" ]] && [[ "${dumpsys##*/}" =~ ^.*([0-9]+)$ ]] || continue
+
+        if [[ "$level" -ge "${BASH_REMATCH[1]}" ]]; then
+            IFS=$'\n' read -d '' -r -a dumpsys_libs < "$dumpsys"
+            i=$((0))
+            for lib in "${dumpsys_libs[@]}"; do
+                if [[ "$lib" == /* ]]; then
+                    libs_lv+=("${lib}")
+                    i=$((i+1))
+                else
+                    echo "  Warning: invalid entry \"$lib\""
+                fi
+            done
+            echo "  +$i: $(basename "$dumpsys")"
+        fi
+    done
+
+    echo "  Total ${#libs_lv[@]} entries"
+    echo ""
+
+    if [[ "${#libs_lv[@]}" -eq 0 ]]; then
+        echo "Libraries list empty"
+        return 0
+    fi
+
+    # Find libraries on the filesystem first, this has priority over cache
+    libs_nf=()
+
+    # Starting from macOS 11 (BigSur) libraries are managed by cache and no longer present on the filesystem
+    dyld_sys_tmp=
+
+    for dyld_sys_cache in "${dyld_sys_caches[@]}"; do
+        if [[ -f "/usr/lib/dsc_extractor.bundle" ]] &&
+            [[ -f "$dyld_sys_cache" ]]; then
+
+            [[ $dyld_sys_tmp ]] || dyld_sys_tmp="$(mktemp -d)"
+
+            echo "Extracting cached libraries from \"$dyld_sys_cache\"..."
+
+            if dyld_shared_cache_util "$dyld_sys_cache" "$dyld_sys_tmp" > /dev/null 2>&1; then
+                echo "  Done"
+            else
+                echo "  Warning: failed to extract cached libraries error=$?"
+            fi
+
+            echo ""
+        fi
+    done
+
+    echo "Inspecting ${#libs_lv[@]} entries..."
+
+    for lib in "${libs_lv[@]}"; do
+        lib_found=
+
+        if [[ -e "$lib" ]]; then
+            lib_found=1
+            mkdir -p "$dump_dir$(dirname $lib)" &&
+                cp -RHf "$lib" "$dump_dir$(dirname $lib)" || echo "  Warning: cp1=$? \"$lib\""
+        fi
+
+        if [[ "$dyld_sys_tmp" ]] && [[ -e "$dyld_sys_tmp$lib" ]]; then
+            lib_found=1
+            mkdir -p "$dump_dir$(dirname $lib)" || echo "  Warning: mkdir=$? \"$lib\""
+                cp -Rn "$dyld_sys_tmp$lib" "$dump_dir$(dirname $lib)" || echo "  Warning: cp2=$? \"$lib\""
+        fi
+
+        if [[ ! $lib_found ]]; then
+            libs_nf+=("$lib")
+        fi
+    done
+
+    echo ""
+
+    # List not found libs
+    if [[ $res -eq 0 ]] && [[ "${#libs_nf[@]}" -gt 0 ]]; then
+        echo "Not found ${#libs_nf[@]} (skipped)"
+        for lib in "${libs_nf[@]}"; do
+            echo "  $lib"
+        done
+        echo ""
+    fi
+
+    res=0
+
+    # Remove cached dir
+    if [[ "$dyld_sys_tmp" ]]; then
+        rm -rf "$dyld_sys_tmp"
+    fi
+
+    tar -c -C "$(dirname "${dump_dir}")" "$(basename "${dump_dir}")" |
+        gzip -6 > "${output_tgz}"
+
+    res=$?
+
+    # Cleanup
+    rm -rf ${dump_dir}
+
+    return $res
+}
